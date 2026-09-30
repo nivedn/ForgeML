@@ -48,9 +48,8 @@ def main(model_file) -> None:
     print("Input shape :", example_input.shape)
     print("Output shape:", output.shape)
 
-
     mlir_text = import_module(model, example_input)
-    # print(mlir_text)
+    print(mlir_text)
 
 
 if __name__ == "__main__":
