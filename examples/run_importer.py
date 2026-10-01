@@ -10,11 +10,12 @@ convention:
 """
 
 import importlib.util
-import sys
 import inspect
+import sys
+
 import torch
-import torch.nn as nn
 from forge_importer import import_module
+from torch import nn
 
 
 def main(model_file) -> None:

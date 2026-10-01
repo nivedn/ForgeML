@@ -2,4 +2,4 @@
 
 from .importer import UnsupportedOpError, import_module
 
-__all__ = ["import_module", "UnsupportedOpError"]
+__all__ = ["UnsupportedOpError", "import_module"]

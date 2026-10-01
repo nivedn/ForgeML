@@ -6,8 +6,7 @@ silently producing wrong IR.
 """
 
 from dataclasses import dataclass, field
-import sys
-from typing_extensions import type_repr
+
 import torch
 from torch.export import export
 
@@ -30,16 +29,12 @@ class EmitContext:
     _counter: int = 0
 
     def fresh_ssa(self) -> str:
-        # TODO: allocate and return the next "%N" name, bump the counter
         ssa = self._counter
         self._counter += 1
         return f"%{ssa}"
 
 
-def emit_matmul(node, ctx: EmitContext) -> None:
-    # TODO: look up operand SSA names from ctx.value_names via node.args,
-    # read the output type from node.meta["val"], append the forge.matmul
-    # line, record the result in ctx.value_names
+def emit_matmul(node: torch.fx.Node, ctx: EmitContext) -> None:
 
     args = node.args
     lhs_node = args[0]
@@ -47,7 +42,16 @@ def emit_matmul(node, ctx: EmitContext) -> None:
 
     ssa_matmul = ctx.fresh_ssa()
     type_lhs_node = tensor_type(lhs_node.meta["val"].shape, lhs_node.meta["val"].dtype)
-    type_rhs_node = tensor_type(rhs_node.meta["val"].shape, rhs_node.meta["val"].dtype)
+    
+    # cheking transpose conditions
+    if (lhs_node.meta["val"].shape[1] != rhs_node.meta["val"].shape[0]) and (lhs_node.meta["val"].shape[1] == rhs_node.meta["val"].shape[1]):
+        transpose_rhs_node = torch.transpose(rhs_node.meta["val"], 0, 1)
+        type_rhs_node = tensor_type(transpose_rhs_node.shape, rhs_node.meta["val"].dtype)
+    elif lhs_node.meta["val"].shape[1] == rhs_node.meta["val"].shape[0]:
+        type_rhs_node = tensor_type(rhs_node.meta["val"].shape, rhs_node.meta["val"].dtype)
+    else:
+        raise("The shapes dont match to perform matmul")
+ 
     type_result_node = tensor_type(node.meta["val"].shape, node.meta["val"].dtype)
     signature = f"({type_lhs_node}, {type_rhs_node}) -> {type_result_node}"
     ctx.lines.append(
@@ -57,8 +61,7 @@ def emit_matmul(node, ctx: EmitContext) -> None:
     ctx.value_names[node] = ssa_matmul
 
 
-def emit_add(node, ctx: EmitContext) -> None:
-    # TODO: same shape as emit_matmul, for forge.add
+def emit_add(node: torch.fx.Node, ctx: EmitContext) -> None:
     args = node.args
 
     ssa_add = ctx.fresh_ssa()
@@ -70,8 +73,7 @@ def emit_add(node, ctx: EmitContext) -> None:
     ctx.value_names[node] = ssa_add
 
 
-def emit_linear(node, ctx: EmitContext) -> None:
-    # TODO: same shape, single operand, for forge.relu
+def emit_linear(node: torch.fx.Node, ctx: EmitContext) -> None:
     args = node.args
 
     ## matmul
@@ -80,7 +82,17 @@ def emit_linear(node, ctx: EmitContext) -> None:
 
     ssa_matmul = ctx.fresh_ssa()
     type_lhs_node = tensor_type(lhs_node.meta["val"].shape, lhs_node.meta["val"].dtype)
-    type_rhs_node = tensor_type(rhs_node.meta["val"].shape, rhs_node.meta["val"].dtype)
+    
+
+    # cheking transpose conditions
+    if (lhs_node.meta["val"].shape[1] != rhs_node.meta["val"].shape[0]) and (lhs_node.meta["val"].shape[1] == rhs_node.meta["val"].shape[1]):
+        transpose_rhs_node = torch.transpose(rhs_node.meta["val"], 0, 1)
+        type_rhs_node = tensor_type(transpose_rhs_node.shape, rhs_node.meta["val"].dtype)
+    elif lhs_node.meta["val"].shape[1] == rhs_node.meta["val"].shape[0]:
+        type_rhs_node = tensor_type(rhs_node.meta["val"].shape, rhs_node.meta["val"].dtype)
+    else:
+        raise("The shapes dont match to perform matmul")
+
     type_result_node = tensor_type(node.meta["val"].shape, node.meta["val"].dtype)
     signature = f"({type_lhs_node}, {type_rhs_node}) -> {type_result_node}"
     ctx.lines.append(
@@ -97,8 +109,7 @@ def emit_linear(node, ctx: EmitContext) -> None:
     ctx.value_names[node] = ssa_add
 
 
-def emit_relu(node, ctx: EmitContext) -> None:
-    # TODO: same shape, single operand, for forge.relu
+def emit_relu(node: torch.fx.Node, ctx: EmitContext) -> None:
     args = node.args
 
     ssa_relu = ctx.fresh_ssa()
@@ -110,9 +121,6 @@ def emit_relu(node, ctx: EmitContext) -> None:
     ctx.value_names[node] = ssa_relu
 
 
-# TODO: confirm the exact op overload names (e.g. torch.ops.aten.mm.default)
-# by printing node.target while walking a real traced graph — overload
-# suffixes aren't always what you'd guess.
 DISPATCH_TABLE = {
     torch.ops.aten.mm.default: emit_matmul,
     torch.ops.aten.add.Tensor: emit_add,
@@ -123,7 +131,7 @@ DISPATCH_TABLE = {
 DTYPE_MAP = {torch.float32: "f32"}
 
 
-def tensor_type(shape, dtype) -> str:
+def tensor_type(shape: torch.Size, dtype: torch.dtype) -> str:
     dtype_str = DTYPE_MAP.get(dtype)
     if dtype_str is None:
         raise UnsupportedOpError(f"unsupported dtype: {dtype}")
@@ -134,18 +142,13 @@ def tensor_type(shape, dtype) -> str:
 def import_module(model: torch.nn.Module, example_input: torch.Tensor) -> str:
     """Traces `model` and returns it as forge-dialect MLIR text."""
     exported = export(model, (example_input,))
-    # print(exported)
     ctx = EmitContext()
-    nodes = {}
 
     for node in exported.graph.nodes:
         # print(f"node {node.op} = {node}")
-        # print(f"dir {dir(node)}")
-        # import pdb; pdb.set_trace()
         if node.op == "placeholder":
             if str(node) in exported.graph_signature.user_inputs:
                 ctx.value_names[node] = "%arg0"
-                # import pdb; pdb.set_trace()
                 input_nodes_type = tensor_type(
                     node.meta["val"].shape, node.meta["val"].dtype
                 )
@@ -157,8 +160,6 @@ def import_module(model: torch.nn.Module, example_input: torch.Tensor) -> str:
             ctx.value_names[node] = f"{ssa}"
 
         elif node.op == "call_function":
-            # TODO: dispatch-table lookup; raise UnsupportedOpError(node.target)
-            # on a miss, no default/fallback case
             if node.target not in DISPATCH_TABLE:
                 raise UnsupportedOpError(node.target)
 
@@ -166,17 +167,12 @@ def import_module(model: torch.nn.Module, example_input: torch.Tensor) -> str:
             emit_func(node, ctx)
 
         elif node.op == "output":
-            # TODO: emit the func.func's `return`, using ctx.value_names
-            # import pdb; pdb.set_trace()
             output_node = node.args[0][0]
             type_output = tensor_type(
                 output_node.meta["val"].shape, output_node.meta["val"].dtype
             )
-            ctx.lines.append(f"return %{ctx.value_names[output_node]} : {type_output}")
+            ctx.lines.append(f"return {ctx.value_names[output_node]} : {type_output}")
 
-    # TODO: wrap ctx.lines in the `func.func @main(...) -> ... { ... }` shell
-    # print("value_names : ", ctx.value_names)
-    # print("line : ", ctx.lines)
     body = "\n".join(f"  {line}" for line in ctx.lines)
     mlir_text = (
         f"func.func @main(%arg0: {input_nodes_type}) -> {type_output} {{\n{body}\n}}\n"
