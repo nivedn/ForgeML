@@ -23,6 +23,10 @@ def main(model_file) -> None:
     model_classes = {}
     model_class_obj_list = []
     spec = importlib.util.spec_from_file_location("model_module", model_file)
+    if spec is None or spec.loader is None:
+        raise SystemExit(
+            f"cannot load {model_file!r} as a Python module (expected a .py file)"
+        )
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
 
@@ -47,7 +51,11 @@ def main(model_file) -> None:
     # Print the model stats
     print(model)
     print("Input shape :", example_input.shape)
-    print("Output shape:", output.shape)
+    if isinstance(output, (tuple, list)):
+        for i, out in enumerate(output):
+            print(f"Output[{i}] shape: {out.shape}")
+    else:
+        print(f"Output shape: {output.shape}")
 
     mlir_text = import_module(model, example_input)
     print(mlir_text)

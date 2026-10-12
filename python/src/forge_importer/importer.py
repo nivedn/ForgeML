@@ -29,11 +29,18 @@ class EmitContext:
         return f"%{ssa}"
 
 
+def as_node(arg: object) -> torch.fx.Node:
+    if not isinstance(arg, torch.fx.Node):
+        raise UnsupportedOpError(f"expected a tensor operand, got {arg!r}")
+    else:
+        return arg
+
+
 def emit_matmul(node: torch.fx.Node, ctx: EmitContext) -> None:
 
     args = node.args
-    lhs_node = args[0]
-    rhs_node = args[1]
+    lhs_node = as_node(args[0])
+    rhs_node = as_node(args[1])
 
     ssa_matmul = ctx.fresh_ssa()
     type_lhs_node = tensor_type(lhs_node.meta["val"].shape, lhs_node.meta["val"].dtype)
@@ -41,7 +48,7 @@ def emit_matmul(node: torch.fx.Node, ctx: EmitContext) -> None:
     type_result_node = tensor_type(node.meta["val"].shape, node.meta["val"].dtype)
     signature = f"({type_lhs_node}, {type_rhs_node}) -> {type_result_node}"
     ctx.lines.append(
-        f"{ssa_matmul} = forge.matmul {ctx.value_names[args[0].name]}, {ctx.value_names[args[1].name]} : {signature}"
+        f"{ssa_matmul} = forge.matmul {ctx.value_names[lhs_node.name]}, {ctx.value_names[rhs_node.name]} : {signature}"
     )
 
     ctx.value_names[node.name] = ssa_matmul
@@ -53,7 +60,7 @@ def emit_add(node: torch.fx.Node, ctx: EmitContext) -> None:
     ssa_add = ctx.fresh_ssa()
     type_str_add = tensor_type(node.meta["val"].shape, node.meta["val"].dtype)
     ctx.lines.append(
-        f"{ssa_add} = forge.add {ctx.value_names[args[0].name]}, {ctx.value_names[args[1].name]} : {type_str_add}"
+        f"{ssa_add} = forge.add {ctx.value_names[as_node(args[0]).name]}, {ctx.value_names[as_node(args[1]).name]} : {type_str_add}"
     )
 
     ctx.value_names[node.name] = ssa_add
@@ -61,10 +68,11 @@ def emit_add(node: torch.fx.Node, ctx: EmitContext) -> None:
 
 def emit_linear(node: torch.fx.Node, ctx: EmitContext) -> None:
     args = node.args
+    with_bias = len(args) > 2
 
     ## matmul
-    lhs_node = args[0]
-    rhs_node = args[1]
+    lhs_node = as_node(args[0])
+    rhs_node = as_node(args[1])
 
     type_lhs_node = tensor_type(lhs_node.meta["val"].shape, lhs_node.meta["val"].dtype)
     type_rhs_node = tensor_type(rhs_node.meta["val"].shape, rhs_node.meta["val"].dtype)
@@ -76,25 +84,28 @@ def emit_linear(node: torch.fx.Node, ctx: EmitContext) -> None:
     )
     ssa_transpose = ctx.fresh_ssa()
     ctx.lines.append(
-        f"{ssa_transpose} = forge.transpose {ctx.value_names[args[1].name]} : ({type_rhs_node}) -> {type_rhs_node_transpose}"
+        f"{ssa_transpose} = forge.transpose {ctx.value_names[rhs_node.name]} : ({type_rhs_node}) -> {type_rhs_node_transpose}"
     )
-    ctx.value_names["transpose"] = ssa_transpose
+    # ctx.value_names["transpose"] = ssa_transpose
 
     ssa_matmul = ctx.fresh_ssa()
     type_result_node = tensor_type(node.meta["val"].shape, node.meta["val"].dtype)
     signature = f"({type_lhs_node}, {type_rhs_node_transpose}) -> {type_result_node}"
     ctx.lines.append(
-        f"{ssa_matmul} = forge.matmul {ctx.value_names[args[0].name]}, {ssa_transpose} : {signature}"
+        f"{ssa_matmul} = forge.matmul {ctx.value_names[lhs_node.name]}, {ssa_transpose} : {signature}"
     )
 
-    ## add
-    ssa_add = ctx.fresh_ssa()
-    type_str_add = tensor_type(node.meta["val"].shape, node.meta["val"].dtype)
-    ctx.lines.append(
-        f"{ssa_add} = forge.add {ssa_matmul}, {ctx.value_names[args[2].name]} : {type_str_add}"
-    )
+    if with_bias:
+        ## add
+        ssa_add = ctx.fresh_ssa()
+        type_str_add = tensor_type(node.meta["val"].shape, node.meta["val"].dtype)
+        ctx.lines.append(
+            f"{ssa_add} = forge.add {ssa_matmul}, {ctx.value_names[as_node(args[2]).name]} : {type_str_add}"
+        )
 
-    ctx.value_names[node.name] = ssa_add
+        ctx.value_names[node.name] = ssa_add
+    else:
+        ctx.value_names[node.name] = ssa_matmul
 
 
 def emit_relu(node: torch.fx.Node, ctx: EmitContext) -> None:
@@ -103,7 +114,7 @@ def emit_relu(node: torch.fx.Node, ctx: EmitContext) -> None:
     ssa_relu = ctx.fresh_ssa()
     type_str_add = tensor_type(node.meta["val"].shape, node.meta["val"].dtype)
     ctx.lines.append(
-        f"{ssa_relu} = forge.relu {ctx.value_names[args[0].name]} : {type_str_add}"
+        f"{ssa_relu} = forge.relu {ctx.value_names[as_node(args[0]).name]} : {type_str_add}"
     )
 
     ctx.value_names[node.name] = ssa_relu
@@ -133,7 +144,6 @@ def import_module(model: torch.nn.Module, example_input: torch.Tensor) -> str:
     ctx = EmitContext()
 
     for node in exported.graph.nodes:
-        # print(f"node {node.op} = {node}")
         if node.op == "placeholder":
             if str(node) in exported.graph_signature.user_inputs:
                 ctx.value_names[node.name] = "%arg0"
@@ -155,16 +165,28 @@ def import_module(model: torch.nn.Module, example_input: torch.Tensor) -> str:
             emit_func(node, ctx)
 
         elif node.op == "output":
-            output_node = node.args[0][0]
+            output_nodes = node.args[0]
+
+    type_outputs = []
+    for out_node in output_nodes:
+        if isinstance(out_node, torch.fx.Node):
             type_output = tensor_type(
-                output_node.meta["val"].shape, output_node.meta["val"].dtype
+                out_node.meta["val"].shape, out_node.meta["val"].dtype
             )
-            ctx.lines.append(
-                f"return {ctx.value_names[output_node.name]} : {type_output}"
-            )
+            type_outputs.append(type_output)
+        else:
+            raise UnsupportedOpError(f"non-tensor output: {out_node!r}")
+
+    names = ", ".join(ctx.value_names[o.name] for o in output_nodes)
+    types = ", ".join(type_outputs)
+
+    ctx.lines.append(f"return {names} : {types}")
+
+    if len(type_outputs) > 1:
+        header_output = f"({types})"
+    else:
+        header_output = types
 
     body = "\n".join(f"  {line}" for line in ctx.lines)
-    mlir_text = (
-        f"func.func @main(%arg0: {input_nodes_type}) -> {type_output} {{\n{body}\n}}\n"
-    )
+    mlir_text = f"func.func @main(%arg0: {input_nodes_type}) -> {header_output} {{\n{body}\n}}\n"
     return mlir_text

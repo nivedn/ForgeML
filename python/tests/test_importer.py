@@ -45,6 +45,18 @@ func.func @main(%arg0: tensor<8x10xf32>) -> tensor<8x4xf32> {
 }
 """
 
+TWO_OUTPUT_IR = """\
+func.func @main(%arg0: tensor<8x10xf32>) -> (tensor<8x4xf32>, tensor<8x4xf32>) {
+  %0 = forge.const dense<0.0> : tensor<4x10xf32>
+  %1 = forge.const dense<0.0> : tensor<4xf32>
+  %2 = forge.transpose %0 : (tensor<4x10xf32>) -> tensor<10x4xf32>
+  %3 = forge.matmul %arg0, %2 : (tensor<8x10xf32>, tensor<10x4xf32>) -> tensor<8x4xf32>
+  %4 = forge.add %3, %1 : tensor<8x4xf32>
+  %5 = forge.relu %4 : tensor<8x4xf32>
+  return %5, %4 : tensor<8x4xf32>, tensor<8x4xf32>
+}
+"""
+
 
 # --- helpers ---------------------------------------------------------------
 
@@ -88,6 +100,35 @@ class _TwoOutputs(nn.Module):
         return F.relu(y), y
 
 
+class _SameValueTwice(nn.Module):
+    def forward(self, x):
+        y = F.relu(x)
+        return y, y
+
+
+class _InputAndResult(nn.Module):
+    def forward(self, x):
+        return x, F.relu(x)
+
+
+class _ThreeOutputs(nn.Module):
+    """Three results with three different shapes, so a header that repeats one
+    type (or reorders them) cannot pass by accident."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.a = nn.Linear(10, 4)
+        self.b = nn.Linear(10, 6)
+
+    def forward(self, x):
+        return self.a(x), self.b(x), F.relu(x)
+
+
+class _ReturnsNone(nn.Module):
+    def forward(self, x):
+        return F.relu(x), None
+
+
 _TENSOR_TYPE = r"tensor<[^>]*>"
 
 
@@ -99,15 +140,17 @@ def _dims(tensor_type: str) -> list[int]:
 
 def _assert_valid_ir(text: str) -> None:
     lines = text.rstrip("\n").splitlines()
+    # one result is bare (`-> T`); several are parenthesised (`-> (T1, T2)`)
+    results = rf"{_TENSOR_TYPE}|\({_TENSOR_TYPE}(?:, {_TENSOR_TYPE})+\)"
     header = re.fullmatch(
-        rf"func\.func @main\(%arg0: ({_TENSOR_TYPE})\) -> ({_TENSOR_TYPE}) \{{",
+        rf"func\.func @main\(%arg0: ({_TENSOR_TYPE})\) -> ({results}) \{{",
         lines[0],
     )
     assert header, f"bad function header: {lines[0]!r}"
     assert lines[-1] == "}", "function body is not closed"
 
     types = {"%arg0": header.group(1)}
-    return_type = header.group(2)
+    return_types = header.group(2).strip("()").split(", ")
     saw_return = False
 
     def type_of(name: str) -> str:
@@ -117,9 +160,17 @@ def _assert_valid_ir(text: str) -> None:
     for raw in lines[1:-1]:
         line = raw.strip()
 
-        ret = re.fullmatch(rf"return (%\w+) : ({_TENSOR_TYPE})", line)
+        ret = re.fullmatch(
+            rf"return (%\w+(?:, %\w+)*) : ({_TENSOR_TYPE}(?:, {_TENSOR_TYPE})*)", line
+        )
         if ret:
-            assert type_of(ret.group(1)) == ret.group(2) == return_type
+            names, declared = ret.group(1).split(", "), ret.group(2).split(", ")
+            assert [type_of(n) for n in names] == declared, (
+                f"returned values disagree with their definitions: {line!r}"
+            )
+            assert declared == return_types, (
+                f"return types {declared} do not match the header's {return_types}"
+            )
             saw_return = True
             continue
 
@@ -239,6 +290,48 @@ def test_add_of_input_with_itself():
     assert "forge.add %arg0, %arg0" in text
 
 
+# --- multiple outputs ------------------------------------------------------
+
+
+def test_two_outputs_match_golden_output():
+    assert import_module(_TwoOutputs(), _x(8, 10)) == TWO_OUTPUT_IR
+
+
+@pytest.mark.parametrize(
+    ("make_model", "n_outputs"),
+    [
+        pytest.param(_TwoOutputs, 2, id="result-and-intermediate"),
+        pytest.param(_SameValueTwice, 2, id="same-value-twice"),
+        pytest.param(_InputAndResult, 2, id="input-and-result"),
+        pytest.param(_ThreeOutputs, 3, id="three-different-shapes"),
+    ],
+)
+def test_every_output_is_returned_and_declared(make_model, n_outputs):
+    text = import_module(make_model(), _x(8, 10))
+    _assert_valid_ir(text)
+
+    lines = text.splitlines()
+    declared = re.search(r"-> (.*) \{$", lines[0]).group(1)
+    returned = lines[-2].removeprefix("return ").split(" : ")[0].split(", ")
+    assert declared.count("tensor<") == n_outputs, "header lists the wrong result count"
+    assert len(returned) == n_outputs, "return carries the wrong value count"
+
+
+def test_outputs_keep_the_order_of_the_return_statement():
+    text = import_module(_ThreeOutputs(), _x(8, 10))
+    header = text.splitlines()[0]
+    assert header.endswith(
+        "-> (tensor<8x4xf32>, tensor<8x6xf32>, tensor<8x10xf32>) {"
+    ), header
+
+
+def test_non_tensor_output_is_rejected():
+    """`return relu(x), None` leaves None in the output tuple. It has no .meta,
+    so it must raise UnsupportedOpError, not a raw AttributeError."""
+    with pytest.raises(UnsupportedOpError):
+        import_module(_ReturnsNone(), _x(8, 10))
+
+
 # --- fail loudly -----------------------------------------------------------
 
 
@@ -299,13 +392,6 @@ def test_linear_without_bias_never_crashes_unexpectedly():
     _assert_valid_ir(text)
     assert "forge.matmul" in text
     assert "forge.add" not in text
-
-
-def test_multiple_outputs_are_rejected_not_truncated():
-    """Single-output is a stated scope limit. Returning only the first of two
-    outputs would silently produce IR for a different function."""
-    with pytest.raises(UnsupportedOpError):
-        import_module(_TwoOutputs(), _x(8, 10))
 
 
 # --- importer hygiene ------------------------------------------------------
